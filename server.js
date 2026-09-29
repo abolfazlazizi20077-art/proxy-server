@@ -1,15 +1,20 @@
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const url = require('url');
 
 const PROXY_USER = 'fund6user';
 const PROXY_PASS = 'fund6pass123';
 
-http.createServer((req, res) => {
+function checkAuth(req) {
     const auth = req.headers['proxy-authorization'];
     const expected = 'Basic ' + Buffer.from(PROXY_USER + ':' + PROXY_PASS).toString('base64');
-    if (!auth || auth !== expected) {
-        res.writeHead(407);
+    return auth === expected;
+}
+
+const server = http.createServer((req, res) => {
+    if (!checkAuth(req)) {
+        res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="proxy"' });
         res.end('Proxy Auth Required');
         return;
     }
@@ -17,7 +22,7 @@ http.createServer((req, res) => {
     const target = url.parse(req.url);
     const options = {
         hostname: target.hostname,
-        port: target.port || 443,
+        port: target.port || 80,
         path: target.path,
         method: req.method,
         headers: { ...req.headers }
@@ -36,6 +41,38 @@ http.createServer((req, res) => {
     });
 
     req.pipe(proxyReq);
-}).listen(process.env.PORT || 8080, () => {
-    console.log('Proxy running');
+});
+
+// HTTPS CONNECT (tunnel)
+server.on('connect', (req, clientSocket, head) => {
+    const auth = req.headers['proxy-authorization'];
+    const expected = 'Basic ' + Buffer.from(PROXY_USER + ':' + PROXY_PASS).toString('base64');
+
+    if (auth !== expected) {
+        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n' +
+            'Proxy-Authenticate: Basic realm="proxy"\r\n\r\n');
+        clientSocket.end();
+        return;
+    }
+
+    const [host, port] = req.url.split(':');
+    const serverSocket = net.connect(port || 443, host, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        serverSocket.write(head);
+        serverSocket.pipe(clientSocket);
+        clientSocket.pipe(serverSocket);
+    });
+
+    serverSocket.on('error', (err) => {
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        clientSocket.end();
+    });
+
+    clientSocket.on('error', () => {
+        serverSocket.end();
+    });
+});
+
+server.listen(process.env.PORT || 8080, () => {
+    console.log('Proxy running with CONNECT support');
 });
